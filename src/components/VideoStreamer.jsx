@@ -1,51 +1,137 @@
 import React, { useState, useEffect, useRef } from "react";
+import { v4 as uuidv4 } from "uuid";
+import { useStream } from "../contexts/StreamContext";
+import StreamSettings from "./StreamSettings";
 
-function VideoStreamer({ wsUrl }) {
+function VideoStreamer({ wsUrl, streamId }) {
   const videoRef = useRef(null);
   const wsRef = useRef(null);
-  const canvasRef = useRef(null);
+  const peerConnectionsRef = useRef(new Map());
+  const localStreamRef = useRef(null);
   const [status, setStatus] = useState("Initializing...");
   const [settings, setSettings] = useState({
     quality: 0.5,
     frameRate: 30,
   });
+  const peerId = useRef(uuidv4());
+  const canvasRef = useRef(null);
+
+  const { state, actions } = useStream();
+
+  const rtcConfig = {
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+    ],
+  };
 
   useEffect(() => {
-    canvasRef.current = document.createElement("canvas");
-    wsRef.current = new WebSocket(wsUrl);
+    let reconnectTimeout;
 
-    wsRef.current.onopen = () => {
-      console.log("Connected to server");
-      startVideo();
+    const connect = () => {
+      wsRef.current = new WebSocket(wsUrl);
+      setupWebSocket();
     };
+
+    const handleReconnect = () => {
+      console.log("Attempting to reconnect...");
+      reconnectTimeout = setTimeout(connect, 3000);
+    };
+
+    wsRef.current = new WebSocket(wsUrl);
+    setupWebSocket();
+
+    wsRef.current.onclose = () => {
+      console.log("WebSocket closed, attempting reconnect...");
+      handleReconnect();
+    };
+
+    startVideo().then(() => {
+      sendFrames();
+    });
 
     return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      clearTimeout(reconnectTimeout);
+      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+      peerConnectionsRef.current.forEach((pc) => pc.close());
+      wsRef.current?.close();
     };
-  }, [wsUrl]);
+  }, [wsUrl, streamId]);
 
   const startVideo = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      console.log("Starting video with streamId:", streamId);
+
+      if (!streamId) {
+        throw new Error("No camera ID provided");
+      }
+
+      const constraints = {
         video: {
-          width: 640,
-          height: 480,
-          frameRate: { ideal: 30 },
+          deviceId: { exact: streamId },
+          width: { ideal: state.settings.resolution.width },
+          height: { ideal: state.settings.resolution.height },
+          frameRate: { ideal: state.settings.frameRate, max: 30 },
         },
         audio: false,
-      });
+      };
+
+      console.log("Attempting to get media with constraints:", constraints);
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+      console.log("Stream obtained successfully");
+      actions.addStream(streamId, stream);
+      actions.clearError(streamId);
+
+      localStreamRef.current = stream;
 
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.onloadedmetadata = () => {
-          sendFrames();
-        };
       }
+
+      peerConnectionsRef.current.forEach((pc) => {
+        const senders = pc.getSenders();
+        const videoSender = senders.find(
+          (sender) => sender.track?.kind === "video"
+        );
+        if (videoSender) {
+          videoSender.replaceTrack(stream.getVideoTracks()[0]);
+        }
+      });
+
+      const videoTrack = stream.getVideoTracks()[0];
+      const settings = videoTrack.getSettings();
+      console.log("Video track settings:", settings);
+
+      setStatus("Camera ready");
     } catch (err) {
-      console.error("Error accessing webcam:", err);
+      console.error("Error accessing camera:", err);
+      actions.setError(streamId, err);
+
+      if (err.name === "NotAllowedError") {
+        setStatus("Camera access denied - please check permissions");
+      } else if (err.name === "NotFoundError") {
+        setStatus(`Camera ${streamId} not found or disconnected`);
+      } else if (err.name === "NotReadableError") {
+        setStatus("Camera is in use by another application");
+      } else {
+        setStatus(`Camera error: ${err.message}`);
+      }
     }
+  };
+
+  const setupWebSocket = () => {
+    wsRef.current.onopen = () => {
+      wsRef.current.send(
+        JSON.stringify({
+          type: "register",
+          role: "streamer",
+          streamId: streamId,
+        })
+      );
+      console.log("Connected to server");
+    };
   };
 
   const sendFrames = () => {
@@ -62,7 +148,6 @@ function VideoStreamer({ wsUrl }) {
         frameCount++;
         const now = Date.now();
 
-        // Calculate and show FPS every second
         if (now - lastTime >= 1000) {
           setStatus(`Streaming at ${frameCount} FPS`);
           frameCount = 0;
@@ -87,58 +172,33 @@ function VideoStreamer({ wsUrl }) {
   };
 
   return (
-    <div className="flex flex-col items-center">
-      <div className="rounded-lg overflow-hidden shadow-lg bg-white p-2 mb-4">
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          className="w-[640px] h-[480px] object-cover"
-        />
-        <div className="mt-2 text-center text-green-600">{status}</div>
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+      <div className="bg-white rounded-2xl shadow-lg overflow-hidden">
+        <div className="relative aspect-video">
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            className="absolute inset-0 w-full h-full object-cover"
+          />
+          <canvas ref={canvasRef} className="hidden" width={640} height={480} />
+          <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/50 to-transparent p-4">
+            <div className="flex items-center gap-2">
+              <div
+                className={`w-2 h-2 rounded-full ${
+                  status.includes("Streaming")
+                    ? "bg-emerald-500"
+                    : "bg-amber-500"
+                } animate-pulse`}
+              />
+              <span className="text-white text-sm font-medium">{status}</span>
+            </div>
+          </div>
+        </div>
       </div>
 
-      <div className="bg-white p-4 rounded-lg shadow-lg w-[640px]">
-        <h3 className="text-lg font-semibold mb-2">Stream Settings</h3>
-
-        <div className="mb-4">
-          <label className="block text-sm font-medium mb-1">
-            Quality: {settings.quality * 100}%
-          </label>
-          <input
-            type="range"
-            min="0.1"
-            max="1"
-            step="0.1"
-            value={settings.quality}
-            onChange={(e) =>
-              setSettings((prev) => ({
-                ...prev,
-                quality: parseFloat(e.target.value),
-              }))
-            }
-            className="w-full"
-          />
-        </div>
-
-        <div className="mb-4">
-          <label className="block text-sm font-medium mb-1">
-            Frame Rate: {settings.frameRate} FPS
-          </label>
-          <input
-            type="range"
-            min="1"
-            max="60"
-            value={settings.frameRate}
-            onChange={(e) =>
-              setSettings((prev) => ({
-                ...prev,
-                frameRate: parseInt(e.target.value),
-              }))
-            }
-            className="w-full"
-          />
-        </div>
+      <div className="mt-8">
+        <StreamSettings streamId={streamId} />
       </div>
     </div>
   );
